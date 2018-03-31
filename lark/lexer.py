@@ -5,6 +5,31 @@ import re
 from .utils import Str, classify
 from .common import is_terminal, PatternStr, PatternRE, TokenDef
 
+
+def build_mres(tokens, max_size=None, match_whole=False):
+    """Recursively chain regular expressions from token definitions into
+    multiple regexes (mres) using alternation.
+
+    Python sets an unreasonable group limit (currently 100) in its re module.
+    Worse, the only way to know we reached it is by catching an AssertionError!
+    This function recursively tries smaller and smaller groups until it's
+    successful.
+    """
+    if max_size is None:
+        max_size = len(tokens)
+
+    postfix = '$' if match_whole else ''
+    mres = []
+    while tokens:
+        try:
+            mre = re.compile(u'|'.join(u'(?P<%s>%s)'%(t.name, t.pattern.to_regexp()+postfix) for t in tokens[:max_size]))
+        except AssertionError:  # Yes, this is what Python provides us.. :/
+            return _build_mres(tokens, max_size//2, match_whole)
+
+        mres.append((mre, {i:n for n,i in mre.groupindex.items()} ))
+        tokens = tokens[max_size:]
+    return mres
+
 ###{standalone
 class LexError(Exception):
     pass
@@ -78,34 +103,42 @@ class LineCounter:
         self.char_pos += len(token)
         self.column = self.char_pos - self.line_start_pos
 
-class _Lex:
+class Tokenizer(object):
     "Built to serve both Lexer and ContextualLexer"
-    def __init__(self, lexer):
-        self.lexer = lexer
+    def __init__(self, token_defs, callback, mres_from_tokens=False):
+        if mres_from_tokens:
+            # The token defs are actually the mres, provided for the benefit
+            # of the standalone parser generator
+            self._mres = token_defs
+        else:
+            self._token_defs = token_defs
+            self._mres = build_mres(token_defs)
+        self._callback = callback
 
-    def lex(self, stream, newline_types, ignore_types):
+    def __call__(self, stream, newline_types, ignore_types):
         newline_types = list(newline_types)
         ignore_types = list(ignore_types)
         line_ctr = LineCounter()
-
+    
         t = None
         while True:
-            lexer = self.lexer
-            for mre, type_from_index in lexer.mres:
+            mres = self.mres
+
+            for mre, type_from_index in mres:
                 m = mre.match(stream, line_ctr.char_pos)
                 if m:
                     value = m.group(0)
                     type_ = type_from_index[m.lastindex]
                     if type_ not in ignore_types:
                         t = Token(type_, value, line_ctr.char_pos, line_ctr.line, line_ctr.column)
-                        if t.type in lexer.callback:
-                            t = lexer.callback[t.type](t)
+                        if t.type in self.callback:
+                            t = self.callback[t.type](t)
                         yield t
                     else:
-                        if type_ in lexer.callback:
+                        if type_ in self.callback:
                             t = Token(type_, value, line_ctr.char_pos, line_ctr.line, line_ctr.column)
-                            lexer.callback[type_](t)
-
+                            self.callback[type_](t)
+    
                     line_ctr.feed(value, type_ in newline_types)
                     if t:
                         t.end_line = line_ctr.line
@@ -115,6 +148,30 @@ class _Lex:
                 if line_ctr.char_pos < len(stream):
                     raise UnexpectedInput(stream, line_ctr.char_pos, line_ctr.line, line_ctr.column)
                 break
+    # end token generator
+
+    @property
+    def token_defs(self):
+        return self._token_defs
+
+    @token_defs.setter
+    def token_defs(self, token_defs):
+        self._token_defs    = token_defs
+        self._mres          = build_mres(token_defs)
+
+    @property
+    def mres(self):
+        return self._mres
+
+    @property
+    def callback(self):
+        return self._callback
+
+    @callback.setter
+    def callback(self, callback):
+        self._callback
+
+# end Tokenizer
 
 class UnlessCallback:
     def __init__(self, mres):
@@ -130,7 +187,6 @@ class UnlessCallback:
         return t
 
 ###}
-
 
 
 def _create_unless(tokens):
@@ -152,26 +208,6 @@ def _create_unless(tokens):
 
     tokens = [t for t in tokens if t not in embedded_strs]
     return tokens, callback
-
-
-def _build_mres(tokens, max_size, match_whole):
-    # Python sets an unreasonable group limit (currently 100) in its re module
-    # Worse, the only way to know we reached it is by catching an AssertionError!
-    # This function recursively tries less and less groups until it's successful.
-    postfix = '$' if match_whole else ''
-    mres = []
-    while tokens:
-        try:
-            mre = re.compile(u'|'.join(u'(?P<%s>%s)'%(t.name, t.pattern.to_regexp()+postfix) for t in tokens[:max_size]))
-        except AssertionError:  # Yes, this is what Python provides us.. :/
-            return _build_mres(tokens, max_size//2, match_whole)
-
-        mres.append((mre, {i:n for n,i in mre.groupindex.items()} ))
-        tokens = tokens[max_size:]
-    return mres
-
-def build_mres(tokens, match_whole=False):
-    return _build_mres(tokens, len(tokens), match_whole)
 
 def _regexp_has_newline(r):
     return '\n' in r or '\\n' in r or ('(?s)' in r and '.' in r)
@@ -209,10 +245,11 @@ class Lexer:
 
         self.tokens = tokens
 
-        self.mres = build_mres(tokens)
+        #self.mres = build_mres(tokens)
 
     def lex(self, stream):
-        return _Lex(self).lex(stream, self.newline_types, self.ignore_types)
+        tokenizer = Tokenizer(self.tokens, self.callback)
+        return tokenizer(stream, self.newline_types, self.ignore_types)
 
 
 class ContextualLexer:
@@ -244,9 +281,12 @@ class ContextualLexer:
         self.parser_state = state
 
     def lex(self, stream):
-        l = _Lex(self.lexers[self.parser_state])
-        for x in l.lex(stream, self.root_lexer.newline_types, self.root_lexer.ignore_types):
-            yield x
-            l.lexer = self.lexers[self.parser_state]
-
+        lexer = self.lexers[self.parser_state]
+        tokenizer = Tokenizer(lexer.tokens, lexer.callback)
+        for x in tokenizer(stream, self.root_lexer.newline_types, self.root_lexer.ignore_types):
+            # TODO: Maybe the calling function can .send(...) the next state here?
+            yield x # => state = yield x
+            lexer = self.lexers[self.parser_state]
+            tokenizer.token_defs = lexer.tokens
+            tokenizer.callback   = lexer.callback
 

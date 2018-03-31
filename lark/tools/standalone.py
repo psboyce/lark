@@ -43,6 +43,7 @@ from collections import defaultdict
 import lark
 from lark import Lark
 from lark.parsers.lalr_analysis import Shift, Reduce
+from lark.lexer import build_mres
 
 from ..grammar import Rule
 
@@ -83,7 +84,7 @@ def extract_sections(lines):
 
 class LexerAtoms:
     def __init__(self, lexer):
-        self.mres = [(p.pattern,d) for p,d in lexer.mres]
+        self.mres = [(p.pattern,d) for p,d in build_mres(lexer.tokens)]
         self.newline_types = lexer.newline_types
         self.ignore_types = lexer.ignore_types
         self.callback = {name:[(p.pattern,d) for p,d in c.mres]
@@ -101,12 +102,12 @@ class LexerAtoms:
         print('IGNORE_TYPES = %s' % self.ignore_types)
         print('class LexerRegexps: pass')
         print('lexer_regexps = LexerRegexps()')
-        print('lexer_regexps.mres = [(re.compile(p), d) for p, d in MRES]')
-        print('lexer_regexps.callback = {n: UnlessCallback([(re.compile(p), d) for p, d in mres])')
+        print('mres = [(re.compile(p), d) for p, d in MRES]')
+        print('callback = {n: UnlessCallback([(re.compile(p), d) for p, d in mres])')
         print('                          for n, mres in LEXER_CALLBACK.items()}')
-        print('lexer = _Lex(lexer_regexps)')
+        print('tokenizer = Tokenizer(mres, callback, mres_from_tokens=True)')
         print('def lex(stream):')
-        print('    return lexer.lex(stream, NEWLINE_TYPES, IGNORE_TYPES)')
+        print('    return tokenizer(stream, NEWLINE_TYPES, IGNORE_TYPES)')
 
 
 class GetRule:
